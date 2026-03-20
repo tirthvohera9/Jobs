@@ -246,13 +246,12 @@ async def parse_resume_endpoint(
         except Exception:
             logger.exception("LinkedIn internship search failed for query: %s", query)
 
-    # Score and filter jobs for relevance
+    # Score, filter and cap
     all_jobs = _score_and_filter_jobs(all_jobs, positive_words, negative_words)
+    all_jobs = all_jobs[:max_results]
 
     jobs_count        = sum(1 for j in all_jobs if not j.get("is_internship"))
     internships_count = sum(1 for j in all_jobs if j.get("is_internship"))
-
-    all_jobs = all_jobs[:max_results]
 
     return {
         "resume": {
