@@ -41,6 +41,34 @@ ALLOWED_EXTENSIONS = {".pdf", ".docx", ".doc", ".txt"}
 MAX_FILE_SIZE_MB = 5
 
 
+def _score_and_filter_jobs(
+    jobs: list[dict],
+    positive_words: list[str],
+    negative_words: list[str],
+) -> list[dict]:
+    """
+    Score each job by how well its title matches the resume's domain.
+    Jobs with clearly irrelevant titles (negative matches) are pushed to the end.
+    Jobs with relevant titles (positive matches) are surfaced first.
+    """
+    def score(job: dict) -> int:
+        title = (job.get("title") or "").lower()
+        s = 0
+        for word in positive_words:
+            if word.lower() in title:
+                s += 2
+        for phrase in negative_words:
+            if phrase.lower() in title:
+                s -= 5
+        return s
+
+    scored = [(score(j), j) for j in jobs]
+    # Remove jobs with a very negative score (clearly wrong domain)
+    scored = [(s, j) for s, j in scored if s > -4]
+    scored.sort(key=lambda x: x[0], reverse=True)
+    return [j for _, j in scored]
+
+
 def _build_filter_kwargs(
     job_types: Optional[List[str]],
     experience_levels: Optional[List[str]],
@@ -152,17 +180,36 @@ async def parse_resume_endpoint(
     if linkedin_name and not resume_data.get("name"):
         resume_data["name"] = linkedin_name
 
-    try:
-        jobs = search_jobs(
-            keywords=resume_data["primary_query"],
-            location=location,
-            max_results=max_results,
-            fetch_descriptions=fetch_descriptions,
-            **_build_filter_kwargs(job_types, experience_levels, work_types, date_posted, easy_apply, sort_by),
-        )
-    except Exception:
-        logger.exception("LinkedIn search failed")
-        jobs = []
+    search_queries = resume_data.get("search_queries") or [resume_data["primary_query"]]
+    positive_words = resume_data.get("positive_words", [])
+    negative_words = resume_data.get("negative_words", [])
+
+    # Search with all queries and combine, deduplicating by job id
+    all_jobs: list[dict] = []
+    seen_ids: set[str] = set()
+    per_query = max(15, max_results)
+    filter_kwargs = _build_filter_kwargs(job_types, experience_levels, work_types, date_posted, easy_apply, sort_by)
+
+    for query in search_queries:
+        try:
+            results = search_jobs(
+                keywords=query,
+                location=location,
+                max_results=per_query,
+                fetch_descriptions=fetch_descriptions,
+                **filter_kwargs,
+            )
+            for job in results:
+                jid = job.get("id") or job.get("url") or ""
+                if jid not in seen_ids:
+                    seen_ids.add(jid)
+                    all_jobs.append(job)
+        except Exception:
+            logger.exception("LinkedIn search failed for query: %s", query)
+
+    # Score and filter jobs for relevance
+    all_jobs = _score_and_filter_jobs(all_jobs, positive_words, negative_words)
+    all_jobs = all_jobs[:max_results]
 
     return {
         "resume": {
@@ -171,11 +218,14 @@ async def parse_resume_endpoint(
             "phone": resume_data.get("phone"),
             "skills": resume_data.get("skills", []),
             "job_titles": resume_data.get("job_titles", []),
+            "education": resume_data.get("education", []),
+            "domain": resume_data.get("domain", ""),
             "primary_query": resume_data.get("primary_query"),
+            "search_queries": search_queries,
         },
-        "jobs": jobs,
-        "total_jobs": len(jobs),
-        "search_query": resume_data["primary_query"],
+        "jobs": all_jobs,
+        "total_jobs": len(all_jobs),
+        "search_query": " · ".join(search_queries),
         "search_location": location,
     }
 

@@ -26,10 +26,28 @@ export default function JobResults({ data, onRefineSearch }) {
           {resume.email && (
             <div><span className="text-gray-500">Email:</span> <span className="font-medium">{resume.email}</span></div>
           )}
+          {resume.domain && (
+            <div>
+              <span className="text-gray-500">Detected Industry:</span>{' '}
+              <span className="font-medium capitalize">{resume.domain.replace(/_/g, ' ')}</span>
+            </div>
+          )}
+          {resume.education?.length > 0 && (
+            <div>
+              <span className="text-gray-500">Education:</span>{' '}
+              <span className="font-medium capitalize">{resume.education.slice(0, 3).join(', ')}</span>
+            </div>
+          )}
           {resume.job_titles?.length > 0 && (
             <div className="sm:col-span-2">
               <span className="text-gray-500">Detected Roles:</span>{' '}
               <span className="font-medium">{resume.job_titles.slice(0, 4).join(' · ')}</span>
+            </div>
+          )}
+          {resume.search_queries?.length > 0 && (
+            <div className="sm:col-span-2">
+              <span className="text-gray-500">Searched For:</span>{' '}
+              <span className="font-medium">{resume.search_queries.join(' · ')}</span>
             </div>
           )}
         </div>
