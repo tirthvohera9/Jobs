@@ -56,7 +56,7 @@ DATE_POSTED_MAP = {"day": "r86400", "week": "r604800", "month": "r2592000"}
 SORT_MAP = {"relevant": "R", "recent": "DD"}
 
 PAGE_SIZE = 25          # LinkedIn returns max 25 per request
-MAX_PAGES_PER_QUERY = 4  # 4 pages = up to 100 results per query; increase for more
+MAX_PAGES_PER_QUERY = 6  # 6 pages = up to 150 results per query
 
 
 def _get_headers() -> dict:

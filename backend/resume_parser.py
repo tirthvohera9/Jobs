@@ -456,9 +456,10 @@ def get_domain_filter_words(domain: str) -> tuple[list[str], list[str]]:
 
 def _analyze_with_claude(text: str) -> Optional[dict]:
     """
-    Use Claude AI to deeply understand the resume and generate targeted job
-    search queries. Returns structured dict or None if API is unavailable.
+    Deep AI resume analysis: reads the entire resume, makes structured notes,
+    then generates targeted job AND internship search queries for LinkedIn.
 
+    Returns structured dict or None if API is unavailable.
     Requires ANTHROPIC_API_KEY environment variable to be set.
     """
     api_key = os.getenv("ANTHROPIC_API_KEY")
@@ -469,49 +470,70 @@ def _analyze_with_claude(text: str) -> Optional[dict]:
         import anthropic
         client = anthropic.Anthropic(api_key=api_key)
 
-        prompt = f"""You are an expert career consultant. Analyze this resume carefully and extract key information to find the most relevant job listings on LinkedIn.
+        prompt = f"""You are a professional career counselor. Carefully read this entire resume and create detailed notes, then build a targeted LinkedIn job search plan.
 
 Resume:
 \"\"\"
-{text[:4000]}
+{text[:5000]}
 \"\"\"
 
-Return ONLY a valid JSON object (no markdown, no explanation) with these fields:
+Study the resume thoroughly:
+- What degree/qualification do they have and in which field?
+- What industry/domain is this person in (banking, insurance, marketing, HR, tech, etc.)?
+- What is their experience level? (fresher = student or 0 experience; entry = 0–2 yrs; mid_senior = 3–7 yrs; senior = 7+ yrs; executive = C-suite)
+- What are their strongest, most marketable skills?
+- What specific job roles suit them best right now?
+- Would they benefit from internships as well as full-time roles?
+
+Return ONLY valid JSON (no markdown, no explanation):
 {{
-  "domain": "primary industry — one of: finance_banking, insurance, accounting, marketing, hr, sales, operations, healthcare, technology, education, legal, other",
-  "subdomain": "specific area e.g. retail banking, life insurance, digital marketing, talent acquisition",
-  "experience_level": "one of: fresher, entry, mid_senior, senior, executive",
-  "job_titles": ["list of 3-5 job titles this person is qualified for or seeking"],
-  "skills": ["list of 10-15 most relevant skills from the resume"],
-  "education": ["qualifications/degrees e.g. BCom Banking and Insurance, MBA Finance"],
-  "search_queries": [
-    "query1 — 2-5 words, most relevant role for this person on LinkedIn",
-    "query2 — alternative relevant role or specialisation",
-    "query3 — broader related role to cast a wider net"
+  "domain": "one of: finance_banking | insurance | accounting | marketing | hr | sales | operations | healthcare | technology | education | legal | other",
+  "subdomain": "specific focus e.g. retail banking, life insurance, digital marketing, talent acquisition",
+  "experience_level": "fresher | entry | mid_senior | senior | executive",
+  "candidate_summary": "2–3 sentence professional profile: who they are, what they studied, what roles suit them",
+  "notes": {{
+    "education": "e.g. BCom Banking & Insurance from XYZ College, 2024",
+    "top_skills": "e.g. Financial analysis, MS Excel, Banking operations, Customer service",
+    "career_stage": "e.g. Fresh graduate ideal for entry-level banking, insurance and financial services roles"
+  }},
+  "job_titles": ["3–5 job titles this person qualifies for or is seeking"],
+  "skills": ["12–18 key skills from the resume"],
+  "education": ["degrees/qualifications e.g. BCom Banking and Insurance, HSC"],
+  "job_queries": [
+    "query1: 2–5 words, primary role matching their domain and level",
+    "query2: alternative role or specialisation in same domain",
+    "query3: adjacent or broader role they could also fit",
+    "query4: another relevant targeted query"
+  ],
+  "internship_queries": [
+    "internship query1: 2–4 words focused on intern/trainee roles in their domain",
+    "internship query2: alternative intern/trainee query"
   ]
 }}
 
-Rules for search_queries:
-- Match the person's ACTUAL domain and level (not tech if they are in finance)
-- A BCom/MBA in Banking & Insurance → queries like 'banking executive', 'insurance analyst', 'financial services trainee'
-- A fresher/recent graduate → include 'trainee', 'associate', 'junior', or 'entry level' terms
-- Queries must be specific enough to return relevant jobs, not generic like 'manager' or 'executive' alone
-- Include both internship-friendly and full-time variations if experience_level is fresher/entry"""
+CRITICAL rules:
+- domain must match their ACTUAL background — BCom Banking & Insurance → finance_banking, NOT technology
+- job_queries for freshers/entry must use junior terms: 'trainee', 'associate', 'executive', 'graduate', 'junior'
+- internship_queries should be short and domain-specific: e.g. 'banking intern', 'finance intern', 'insurance trainee', 'marketing intern'
+- NEVER generate vague queries like just 'manager', 'executive', 'professional', or 'associate' alone
+- BCom/BBA/MBA Finance or Banking & Insurance → queries about banking executive, insurance executive, financial analyst, etc.
+- All queries must be specific enough to return relevant LinkedIn listings for this person's actual background"""
 
         message = client.messages.create(
             model="claude-haiku-4-5-20251001",
-            max_tokens=800,
+            max_tokens=1000,
             messages=[{"role": "user", "content": prompt}],
-            timeout=20,
         )
 
         raw = message.content[0].text.strip()
-        # Strip markdown code fences if present
         raw = re.sub(r'^```(?:json)?\s*', '', raw)
         raw = re.sub(r'\s*```$', '', raw)
         result = json.loads(raw)
-        logger.info("Claude analysis: domain=%s level=%s queries=%s",
-                    result.get("domain"), result.get("experience_level"), result.get("search_queries"))
+        logger.info(
+            "Claude analysis: domain=%s level=%s job_queries=%s internship_queries=%s",
+            result.get("domain"), result.get("experience_level"),
+            result.get("job_queries"), result.get("internship_queries"),
+        )
         return result
 
     except Exception as exc:
@@ -550,35 +572,55 @@ def parse_resume(file_bytes: bytes, filename: str) -> dict:
     skills      = ai.get("skills") or skills_kw          if ai else skills_kw
     exp_level   = ai.get("experience_level", "")         if ai else ""
 
-    ai_queries = [q for q in (ai.get("search_queries") or []) if q] if ai else []
-    search_queries = ai_queries or search_queries_kw
+    # Separate job queries and internship queries from AI (or fall back to keyword queries)
+    ai_job_queries  = [q for q in (ai.get("job_queries") or ai.get("search_queries") or []) if q] if ai else []
+    ai_intern_queries = [q for q in (ai.get("internship_queries") or []) if q] if ai else []
 
-    # Add experience-level terms to queries for freshers/interns
-    if exp_level in ("fresher", "entry") and search_queries:
+    job_queries = ai_job_queries or search_queries_kw
+
+    # Add junior terms for freshers who don't already have them
+    if exp_level in ("fresher", "entry"):
         levelled = []
-        for q in search_queries:
+        for q in job_queries:
             low = q.lower()
             if not any(w in low for w in ("intern", "trainee", "fresher", "entry", "junior", "associate", "graduate")):
                 levelled.append(q + " trainee")
             levelled.append(q)
-        search_queries = list(dict.fromkeys(levelled))[:4]  # deduplicate, keep order
+        job_queries = list(dict.fromkeys(levelled))[:5]
+
+    # Build internship queries if AI didn't provide them
+    if not ai_intern_queries:
+        base = domain.replace("_", " ").split()[0]  # e.g. "finance" from "finance_banking"
+        ai_intern_queries = [f"{base} intern", f"{base} trainee"]
+
+    internship_queries = ai_intern_queries[:3]
+
+    # Unified list for backward-compat (job queries first)
+    search_queries = list(dict.fromkeys(job_queries))
+
+    candidate_summary = (ai.get("candidate_summary") or "") if ai else ""
+    notes = (ai.get("notes") or {}) if ai else {}
 
     positive_words, negative_words = get_domain_filter_words(domain)
-    primary_query = search_queries[0] if search_queries else "professional"
+    primary_query = job_queries[0] if job_queries else "professional"
 
     return {
-        "name":           extract_name(text),
-        "email":          extract_email(text),
-        "phone":          extract_phone(text),
-        "skills":         skills,
-        "job_titles":     job_titles,
-        "education":      education,
-        "domain":         domain,
-        "experience_level": exp_level,
-        "primary_query":  primary_query,
-        "search_queries": search_queries,
-        "positive_words": positive_words,
-        "negative_words": negative_words,
-        "ai_powered":     ai is not None,
-        "raw_text_preview": text[:500],
+        "name":               extract_name(text),
+        "email":              extract_email(text),
+        "phone":              extract_phone(text),
+        "skills":             skills,
+        "job_titles":         job_titles,
+        "education":          education,
+        "domain":             domain,
+        "experience_level":   exp_level,
+        "primary_query":      primary_query,
+        "search_queries":     search_queries,
+        "job_queries":        job_queries,
+        "internship_queries": internship_queries,
+        "candidate_summary":  candidate_summary,
+        "notes":              notes,
+        "positive_words":     positive_words,
+        "negative_words":     negative_words,
+        "ai_powered":         ai is not None,
+        "raw_text_preview":   text[:500],
     }

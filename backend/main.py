@@ -146,7 +146,7 @@ async def get_profile(authorization: Optional[str] = Header(default=None)):
 async def parse_resume_endpoint(
     file: UploadFile = File(...),
     location: Optional[str] = Query(default=""),
-    max_results: int = Query(default=50, ge=1, le=200),
+    max_results: int = Query(default=100, ge=1, le=300),
     fetch_descriptions: bool = Query(default=False),
     linkedin_name: Optional[str] = Query(default=None),
     # ── filters ──────────────────────────────────────────────────────────
@@ -180,9 +180,10 @@ async def parse_resume_endpoint(
     if linkedin_name and not resume_data.get("name"):
         resume_data["name"] = linkedin_name
 
-    search_queries = resume_data.get("search_queries") or [resume_data["primary_query"]]
-    positive_words = resume_data.get("positive_words", [])
-    negative_words = resume_data.get("negative_words", [])
+    job_queries        = resume_data.get("job_queries") or [resume_data["primary_query"]]
+    internship_queries = resume_data.get("internship_queries") or []
+    positive_words     = resume_data.get("positive_words", [])
+    negative_words     = resume_data.get("negative_words", [])
 
     # Auto-map Claude's experience_level to LinkedIn filter if user didn't specify
     if not experience_levels:
@@ -196,19 +197,18 @@ async def parse_resume_endpoint(
         ai_level = resume_data.get("experience_level", "")
         experience_levels = exp_map.get(ai_level) or None
 
-    # Search with all queries and combine, deduplicating by job id
     all_jobs: list[dict] = []
-    seen_ids: set[str] = set()
-    # Fetch up to 50 per query — scraper handles pagination internally
-    per_query = 50
+    seen_ids: set[str]   = set()
     filter_kwargs = _build_filter_kwargs(job_types, experience_levels, work_types, date_posted, easy_apply, sort_by)
 
-    for query in search_queries:
+    # ── 1. Job searches (full-time / general) ────────────────────────────
+    per_job_query = 60
+    for query in job_queries:
         try:
             results = search_jobs(
                 keywords=query,
                 location=location,
-                max_results=per_query,
+                max_results=per_job_query,
                 fetch_descriptions=fetch_descriptions,
                 **filter_kwargs,
             )
@@ -218,30 +218,66 @@ async def parse_resume_endpoint(
                     seen_ids.add(jid)
                     all_jobs.append(job)
         except Exception:
-            logger.exception("LinkedIn search failed for query: %s", query)
+            logger.exception("LinkedIn job search failed for query: %s", query)
+
+    # ── 2. Internship searches (always run to surface internship listings) ──
+    intern_filter = dict(filter_kwargs)
+    if not intern_filter.get("job_types"):
+        intern_filter["job_types"] = ["internship"]
+    elif "internship" not in intern_filter["job_types"]:
+        intern_filter["job_types"] = list(intern_filter["job_types"]) + ["internship"]
+
+    per_intern_query = 40
+    for query in internship_queries:
+        try:
+            results = search_jobs(
+                keywords=query,
+                location=location,
+                max_results=per_intern_query,
+                fetch_descriptions=fetch_descriptions,
+                **intern_filter,
+            )
+            for job in results:
+                job["is_internship"] = True
+                jid = job.get("id") or job.get("url") or ""
+                if jid not in seen_ids:
+                    seen_ids.add(jid)
+                    all_jobs.append(job)
+        except Exception:
+            logger.exception("LinkedIn internship search failed for query: %s", query)
 
     # Score and filter jobs for relevance
     all_jobs = _score_and_filter_jobs(all_jobs, positive_words, negative_words)
+
+    jobs_count        = sum(1 for j in all_jobs if not j.get("is_internship"))
+    internships_count = sum(1 for j in all_jobs if j.get("is_internship"))
+
     all_jobs = all_jobs[:max_results]
 
     return {
         "resume": {
-            "name": resume_data.get("name"),
-            "email": resume_data.get("email"),
-            "phone": resume_data.get("phone"),
-            "skills": resume_data.get("skills", []),
-            "job_titles": resume_data.get("job_titles", []),
-            "education": resume_data.get("education", []),
-            "domain": resume_data.get("domain", ""),
-            "experience_level": resume_data.get("experience_level", ""),
-            "ai_powered": resume_data.get("ai_powered", False),
-            "primary_query": resume_data.get("primary_query"),
-            "search_queries": search_queries,
+            "name":               resume_data.get("name"),
+            "email":              resume_data.get("email"),
+            "phone":              resume_data.get("phone"),
+            "skills":             resume_data.get("skills", []),
+            "job_titles":         resume_data.get("job_titles", []),
+            "education":          resume_data.get("education", []),
+            "domain":             resume_data.get("domain", ""),
+            "experience_level":   resume_data.get("experience_level", ""),
+            "ai_powered":         resume_data.get("ai_powered", False),
+            "candidate_summary":  resume_data.get("candidate_summary", ""),
+            "notes":              resume_data.get("notes", {}),
+            "primary_query":      resume_data.get("primary_query"),
+            "search_queries":     job_queries,
+            "job_queries":        job_queries,
+            "internship_queries": internship_queries,
         },
-        "jobs": all_jobs,
-        "total_jobs": len(all_jobs),
-        "search_query": " · ".join(search_queries),
-        "search_location": location,
+        "jobs":               all_jobs,
+        "total_jobs":         len(all_jobs),
+        "jobs_count":         jobs_count,
+        "internships_count":  internships_count,
+        "search_query":       " · ".join(job_queries),
+        "search_location":    location,
     }
 
 

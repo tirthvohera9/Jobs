@@ -38,7 +38,14 @@ export default function JobCard({ job, index }) {
         <div className="flex-1 min-w-0">
           <div className="flex items-start justify-between gap-2">
             <div>
-              <h3 className="font-semibold text-gray-900 leading-tight">{job.title}</h3>
+              <div className="flex items-center gap-2 flex-wrap">
+                <h3 className="font-semibold text-gray-900 leading-tight">{job.title}</h3>
+                {job.is_internship && (
+                  <span className="text-xs bg-purple-50 text-purple-700 border border-purple-200 px-2 py-0.5 rounded-full font-medium">
+                    Internship
+                  </span>
+                )}
+              </div>
               <p className="text-sm text-gray-600 mt-0.5">{job.company}</p>
             </div>
             <span className="text-xs font-semibold text-white bg-linkedin-blue px-2 py-0.5 rounded-full flex-shrink-0">

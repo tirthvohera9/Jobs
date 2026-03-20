@@ -79,7 +79,7 @@ export default function App() {
     try {
       const formData = new FormData()
       formData.append('file', file)
-      const params = new URLSearchParams({ max_results: 20, location: location || '' })
+      const params = new URLSearchParams({ max_results: 100, location: location || '' })
       if (user?.name) params.set('linkedin_name', user.name)
       buildFilterParams(filters).forEach((v, k) => params.set(k, v))
 
@@ -107,7 +107,7 @@ export default function App() {
       const params = new URLSearchParams({
         keywords: searchKeywords,
         location: searchLocation,
-        max_results: 20,
+        max_results: 50,
       })
       buildFilterParams(filters).forEach((v, k) => params.set(k, v))
 
