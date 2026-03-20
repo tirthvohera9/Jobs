@@ -550,12 +550,8 @@ def parse_resume(file_bytes: bytes, filename: str) -> dict:
     skills      = ai.get("skills") or skills_kw          if ai else skills_kw
     exp_level   = ai.get("experience_level", "")         if ai else ""
 
-    search_queries = (
-        [q for q in (ai.get("search_queries") or []) if q]
-        or search_queries_kw
-    )
-    if not search_queries:
-        search_queries = search_queries_kw
+    ai_queries = [q for q in (ai.get("search_queries") or []) if q] if ai else []
+    search_queries = ai_queries or search_queries_kw
 
     # Add experience-level terms to queries for freshers/interns
     if exp_level in ("fresher", "entry") and search_queries:

@@ -173,10 +173,9 @@ async def parse_resume_endpoint(
         resume_data = parse_resume(file_bytes, filename)
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc))
-    except Exception as exc:
+    except Exception:
         logger.exception("Resume parsing failed")
-        import traceback
-        raise HTTPException(status_code=500, detail=f"Failed to parse resume: {type(exc).__name__}: {exc}\n{traceback.format_exc()}")
+        raise HTTPException(status_code=500, detail="Failed to parse resume.")
 
     if linkedin_name and not resume_data.get("name"):
         resume_data["name"] = linkedin_name
