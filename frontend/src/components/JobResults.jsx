@@ -18,7 +18,14 @@ export default function JobResults({ data, onRefineSearch }) {
     <div className="space-y-6">
       {/* Resume summary */}
       <div className="card p-5">
-        <h2 className="font-semibold text-lg text-gray-800 mb-3">Resume Summary</h2>
+        <div className="flex items-center justify-between mb-3">
+          <h2 className="font-semibold text-lg text-gray-800">Resume Summary</h2>
+          {resume.ai_powered && (
+            <span className="text-xs bg-green-50 text-green-700 border border-green-200 px-2 py-0.5 rounded-full font-medium">
+              ✦ AI-Powered Analysis
+            </span>
+          )}
+        </div>
         <div className="grid grid-cols-1 sm:grid-cols-2 gap-x-8 gap-y-2 text-sm">
           {resume.name && (
             <div><span className="text-gray-500">Name:</span> <span className="font-medium">{resume.name}</span></div>
@@ -30,6 +37,12 @@ export default function JobResults({ data, onRefineSearch }) {
             <div>
               <span className="text-gray-500">Detected Industry:</span>{' '}
               <span className="font-medium capitalize">{resume.domain.replace(/_/g, ' ')}</span>
+            </div>
+          )}
+          {resume.experience_level && (
+            <div>
+              <span className="text-gray-500">Experience Level:</span>{' '}
+              <span className="font-medium capitalize">{resume.experience_level.replace(/_/g, ' ')}</span>
             </div>
           )}
           {resume.education?.length > 0 && (

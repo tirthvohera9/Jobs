@@ -2,13 +2,21 @@
 Resume parser module — extracts text and key information from PDF/DOCX files.
 Supports all domains: finance, banking, insurance, accounting, marketing, HR,
 sales, operations, healthcare, technology, and more.
+
+Uses Claude AI (via Anthropic API) for intelligent resume analysis when
+ANTHROPIC_API_KEY is set. Falls back to keyword-based analysis otherwise.
 """
 
 import io
+import os
 import re
+import json
+import logging
 from typing import Optional
 import pdfplumber
 from docx import Document
+
+logger = logging.getLogger(__name__)
 
 
 # ── Domain keyword sets ───────────────────────────────────────────────────────
@@ -444,6 +452,73 @@ def get_domain_filter_words(domain: str) -> tuple[list[str], list[str]]:
         return positive, tech_negative
 
 
+# ── Claude AI resume analysis ─────────────────────────────────────────────────
+
+def _analyze_with_claude(text: str) -> Optional[dict]:
+    """
+    Use Claude AI to deeply understand the resume and generate targeted job
+    search queries. Returns structured dict or None if API is unavailable.
+
+    Requires ANTHROPIC_API_KEY environment variable to be set.
+    """
+    api_key = os.getenv("ANTHROPIC_API_KEY")
+    if not api_key:
+        return None
+
+    try:
+        import anthropic
+        client = anthropic.Anthropic(api_key=api_key)
+
+        prompt = f"""You are an expert career consultant. Analyze this resume carefully and extract key information to find the most relevant job listings on LinkedIn.
+
+Resume:
+\"\"\"
+{text[:4000]}
+\"\"\"
+
+Return ONLY a valid JSON object (no markdown, no explanation) with these fields:
+{{
+  "domain": "primary industry — one of: finance_banking, insurance, accounting, marketing, hr, sales, operations, healthcare, technology, education, legal, other",
+  "subdomain": "specific area e.g. retail banking, life insurance, digital marketing, talent acquisition",
+  "experience_level": "one of: fresher, entry, mid_senior, senior, executive",
+  "job_titles": ["list of 3-5 job titles this person is qualified for or seeking"],
+  "skills": ["list of 10-15 most relevant skills from the resume"],
+  "education": ["qualifications/degrees e.g. BCom Banking and Insurance, MBA Finance"],
+  "search_queries": [
+    "query1 — 2-5 words, most relevant role for this person on LinkedIn",
+    "query2 — alternative relevant role or specialisation",
+    "query3 — broader related role to cast a wider net"
+  ]
+}}
+
+Rules for search_queries:
+- Match the person's ACTUAL domain and level (not tech if they are in finance)
+- A BCom/MBA in Banking & Insurance → queries like 'banking executive', 'insurance analyst', 'financial services trainee'
+- A fresher/recent graduate → include 'trainee', 'associate', 'junior', or 'entry level' terms
+- Queries must be specific enough to return relevant jobs, not generic like 'manager' or 'executive' alone
+- Include both internship-friendly and full-time variations if experience_level is fresher/entry"""
+
+        message = client.messages.create(
+            model="claude-haiku-4-5-20251001",
+            max_tokens=800,
+            messages=[{"role": "user", "content": prompt}],
+            timeout=20,
+        )
+
+        raw = message.content[0].text.strip()
+        # Strip markdown code fences if present
+        raw = re.sub(r'^```(?:json)?\s*', '', raw)
+        raw = re.sub(r'\s*```$', '', raw)
+        result = json.loads(raw)
+        logger.info("Claude analysis: domain=%s level=%s queries=%s",
+                    result.get("domain"), result.get("experience_level"), result.get("search_queries"))
+        return result
+
+    except Exception as exc:
+        logger.warning("Claude analysis failed (%s), falling back to keyword analysis.", exc)
+        return None
+
+
 # ── Main entry point ──────────────────────────────────────────────────────────
 
 def parse_resume(file_bytes: bytes, filename: str) -> dict:
@@ -454,30 +529,60 @@ def parse_resume(file_bytes: bytes, filename: str) -> dict:
     elif filename_lower.endswith((".docx", ".doc")):
         text = extract_text_from_docx(file_bytes)
     elif filename_lower.endswith(".txt"):
-        text = text = file_bytes.decode("utf-8", errors="ignore")
+        text = file_bytes.decode("utf-8", errors="ignore")
     else:
         raise ValueError(f"Unsupported file type: {filename}")
 
-    domain = detect_domain(text)
-    education = extract_education(text)
-    job_titles = extract_job_titles(text)
-    skills = extract_all_skills(text, domain)
-    positive_words, negative_words = get_domain_filter_words(domain)
+    # Always run keyword-based extraction (used as fallback and to fill gaps)
+    domain_kw         = detect_domain(text)
+    education_kw      = extract_education(text)
+    job_titles_kw     = extract_job_titles(text)
+    skills_kw         = extract_all_skills(text, domain_kw)
+    search_queries_kw = build_search_queries(domain_kw, job_titles_kw, education_kw, text)
 
-    search_queries = build_search_queries(domain, job_titles, education, text)
+    # Try Claude AI for smarter analysis
+    ai = _analyze_with_claude(text)
+
+    # Merge: prefer AI results, fill missing fields with keyword results
+    domain      = ai.get("domain") or domain_kw          if ai else domain_kw
+    education   = ai.get("education") or education_kw    if ai else education_kw
+    job_titles  = ai.get("job_titles") or job_titles_kw  if ai else job_titles_kw
+    skills      = ai.get("skills") or skills_kw          if ai else skills_kw
+    exp_level   = ai.get("experience_level", "")         if ai else ""
+
+    search_queries = (
+        [q for q in (ai.get("search_queries") or []) if q]
+        or search_queries_kw
+    )
+    if not search_queries:
+        search_queries = search_queries_kw
+
+    # Add experience-level terms to queries for freshers/interns
+    if exp_level in ("fresher", "entry") and search_queries:
+        levelled = []
+        for q in search_queries:
+            low = q.lower()
+            if not any(w in low for w in ("intern", "trainee", "fresher", "entry", "junior", "associate", "graduate")):
+                levelled.append(q + " trainee")
+            levelled.append(q)
+        search_queries = list(dict.fromkeys(levelled))[:4]  # deduplicate, keep order
+
+    positive_words, negative_words = get_domain_filter_words(domain)
     primary_query = search_queries[0] if search_queries else "professional"
 
     return {
-        "name": extract_name(text),
-        "email": extract_email(text),
-        "phone": extract_phone(text),
-        "skills": skills,
-        "job_titles": job_titles,
-        "education": education,
-        "domain": domain,
-        "primary_query": primary_query,
+        "name":           extract_name(text),
+        "email":          extract_email(text),
+        "phone":          extract_phone(text),
+        "skills":         skills,
+        "job_titles":     job_titles,
+        "education":      education,
+        "domain":         domain,
+        "experience_level": exp_level,
+        "primary_query":  primary_query,
         "search_queries": search_queries,
         "positive_words": positive_words,
         "negative_words": negative_words,
+        "ai_powered":     ai is not None,
         "raw_text_preview": text[:500],
     }

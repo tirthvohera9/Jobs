@@ -6,23 +6,31 @@ Flow:
   2. LinkedIn redirects back to /api/auth/linkedin/callback?code=...
   3. Backend exchanges code for access token
   4. Backend fetches user profile from LinkedIn API
-  5. Returns token + profile to frontend (via redirect with query params or JSON)
+  5. Redirects to frontend with token + profile as query params
 
-Required environment variables:
+Stateless state token:
+  Instead of an in-memory dict (which breaks on serverless — each request is a
+  new process), we encode the timestamp into the state param and sign it with
+  APP_SECRET_KEY using HMAC-SHA256. No server-side storage required.
+
+Required environment variables (set in Vercel Dashboard → Settings → Environment Variables):
   LINKEDIN_CLIENT_ID      — from your LinkedIn Developer App
   LINKEDIN_CLIENT_SECRET  — from your LinkedIn Developer App
-  FRONTEND_URL            — base URL of the frontend (for redirect after OAuth)
-  APP_SECRET_KEY          — secret for signing session tokens
+  APP_SECRET_KEY          — any random secret string (for signing state tokens)
+
+Auto-detected from Vercel (no manual setup needed):
+  FRONTEND_URL            — derived from VERCEL_PROJECT_PRODUCTION_URL or VERCEL_URL
+  LINKEDIN_REDIRECT_URI   — same base URL + /api/auth/linkedin/callback
 
 LinkedIn Developer App setup:
   https://www.linkedin.com/developers/apps/new
   Required OAuth 2.0 scopes: openid, profile, email
-  Add redirect URL: http://localhost:8000/api/auth/linkedin/callback
+  Add redirect URL: https://<your-vercel-domain>/api/auth/linkedin/callback
 """
 
 import os
 import time
-import secrets
+import hmac
 import hashlib
 import base64
 import logging
@@ -33,36 +41,79 @@ from fastapi import HTTPException
 
 logger = logging.getLogger(__name__)
 
-LINKEDIN_CLIENT_ID = os.getenv("LINKEDIN_CLIENT_ID", "")
+LINKEDIN_CLIENT_ID     = os.getenv("LINKEDIN_CLIENT_ID", "")
 LINKEDIN_CLIENT_SECRET = os.getenv("LINKEDIN_CLIENT_SECRET", "")
-FRONTEND_URL = os.getenv("FRONTEND_URL", "http://localhost:5173")
-REDIRECT_URI = os.getenv(
-    "LINKEDIN_REDIRECT_URI", "http://localhost:8000/api/auth/linkedin/callback"
+APP_SECRET_KEY         = os.getenv("APP_SECRET_KEY", "change-me-in-production")
+
+# Auto-detect the base URL from Vercel environment variables.
+# VERCEL_PROJECT_PRODUCTION_URL is the stable production URL (no https:// prefix).
+# VERCEL_URL is the per-deployment URL (also no prefix). Falls back to localhost.
+_vercel_prod = os.getenv("VERCEL_PROJECT_PRODUCTION_URL", "")
+_vercel_any  = os.getenv("VERCEL_URL", "")
+_base_host   = _vercel_prod or _vercel_any
+
+FRONTEND_URL  = os.getenv(
+    "FRONTEND_URL",
+    f"https://{_base_host}" if _base_host else "http://localhost:5173",
+)
+REDIRECT_URI  = os.getenv(
+    "LINKEDIN_REDIRECT_URI",
+    f"https://{_base_host}/api/auth/linkedin/callback" if _base_host else "http://localhost:8000/api/auth/linkedin/callback",
 )
 
-LINKEDIN_AUTH_URL = "https://www.linkedin.com/oauth/v2/authorization"
-LINKEDIN_TOKEN_URL = "https://www.linkedin.com/oauth/v2/accessToken"
-LINKEDIN_PROFILE_URL = "https://api.linkedin.com/v2/userinfo"  # OpenID Connect userinfo
+LINKEDIN_AUTH_URL    = "https://www.linkedin.com/oauth/v2/authorization"
+LINKEDIN_TOKEN_URL   = "https://www.linkedin.com/oauth/v2/accessToken"
+LINKEDIN_PROFILE_URL = "https://api.linkedin.com/v2/userinfo"
 
-# In-memory state store (use Redis/DB in production)
-_state_store: dict[str, float] = {}
 STATE_TTL = 600  # 10 minutes
 
 
+# ── Stateless HMAC state tokens ───────────────────────────────────────────────
+
+def _make_state() -> str:
+    """
+    Create a tamper-proof state token containing the current timestamp.
+    Format: base64(timestamp) . hmac_signature[:16]
+    No server-side storage needed — the signature proves authenticity.
+    """
+    ts = str(int(time.time())).encode()
+    ts_b64 = base64.urlsafe_b64encode(ts).decode().rstrip("=")
+    sig = hmac.new(APP_SECRET_KEY.encode(), ts_b64.encode(), hashlib.sha256).hexdigest()[:20]
+    return f"{ts_b64}.{sig}"
+
+
+def _verify_state(state: str) -> bool:
+    """Verify the state token was issued by us and is not expired."""
+    try:
+        ts_b64, sig = state.rsplit(".", 1)
+        expected = hmac.new(APP_SECRET_KEY.encode(), ts_b64.encode(), hashlib.sha256).hexdigest()[:20]
+        if not hmac.compare_digest(sig, expected):
+            return False
+        # Pad base64 and decode timestamp
+        padding = "=" * (-len(ts_b64) % 4)
+        timestamp = int(base64.urlsafe_b64decode(ts_b64 + padding).decode())
+        return (time.time() - timestamp) < STATE_TTL
+    except Exception:
+        return False
+
+
+# ── Public API ────────────────────────────────────────────────────────────────
+
 def generate_login_url() -> tuple[str, str]:
     """
-    Generate the LinkedIn OAuth authorization URL and a CSRF state token.
+    Generate the LinkedIn OAuth authorization URL.
     Returns (url, state).
     """
     if not LINKEDIN_CLIENT_ID:
         raise HTTPException(
             status_code=503,
-            detail="LinkedIn OAuth not configured. Set LINKEDIN_CLIENT_ID and LINKEDIN_CLIENT_SECRET.",
+            detail=(
+                "LinkedIn OAuth is not configured. "
+                "Set LINKEDIN_CLIENT_ID and LINKEDIN_CLIENT_SECRET in Vercel environment variables."
+            ),
         )
 
-    state = secrets.token_urlsafe(32)
-    _state_store[state] = time.time()
-
+    state = _make_state()
     params = {
         "response_type": "code",
         "client_id": LINKEDIN_CLIENT_ID,
@@ -74,23 +125,10 @@ def generate_login_url() -> tuple[str, str]:
     return url, state
 
 
-def _cleanup_expired_states():
-    now = time.time()
-    expired = [k for k, ts in _state_store.items() if now - ts > STATE_TTL]
-    for k in expired:
-        del _state_store[k]
-
-
 async def exchange_code_for_token(code: str, state: str) -> dict:
-    """
-    Exchange OAuth authorization code for an access token.
-    Returns the token response dict.
-    """
-    _cleanup_expired_states()
-
-    if state not in _state_store:
-        raise HTTPException(status_code=400, detail="Invalid or expired OAuth state.")
-    del _state_store[state]
+    """Exchange OAuth authorization code for an access token."""
+    if not _verify_state(state):
+        raise HTTPException(status_code=400, detail="Invalid or expired OAuth state. Please try signing in again.")
 
     async with httpx.AsyncClient() as client:
         resp = await client.post(
@@ -114,10 +152,7 @@ async def exchange_code_for_token(code: str, state: str) -> dict:
 
 
 async def fetch_linkedin_profile(access_token: str) -> dict:
-    """
-    Fetch the authenticated user's LinkedIn profile using OpenID Connect userinfo.
-    Returns a dict with: sub, name, given_name, family_name, email, picture, locale.
-    """
+    """Fetch user profile via OpenID Connect userinfo endpoint."""
     async with httpx.AsyncClient() as client:
         resp = await client.get(
             LINKEDIN_PROFILE_URL,
@@ -133,10 +168,7 @@ async def fetch_linkedin_profile(access_token: str) -> dict:
 
 
 async def get_linkedin_profile_and_token(code: str, state: str) -> dict:
-    """
-    Full OAuth callback handler: exchange code → token → profile.
-    Returns combined dict with access_token and profile fields.
-    """
+    """Full OAuth callback: exchange code → token → profile."""
     token_data = await exchange_code_for_token(code, state)
     access_token = token_data.get("access_token")
     if not access_token:
@@ -148,11 +180,11 @@ async def get_linkedin_profile_and_token(code: str, state: str) -> dict:
         "access_token": access_token,
         "expires_in": token_data.get("expires_in"),
         "profile": {
-            "id": profile.get("sub"),
-            "name": profile.get("name"),
-            "given_name": profile.get("given_name"),
+            "id":          profile.get("sub"),
+            "name":        profile.get("name"),
+            "given_name":  profile.get("given_name"),
             "family_name": profile.get("family_name"),
-            "email": profile.get("email"),
-            "picture": profile.get("picture"),
+            "email":       profile.get("email"),
+            "picture":     profile.get("picture"),
         },
     }
